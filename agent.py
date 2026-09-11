@@ -99,7 +99,8 @@ def refresh_system_prompt(messages, build, relevant_memories, todo_text):
 
 
 #agent loop
-def agent_loop(messages, todo_manager, active_request, relevant_memories=(),is_term_turn=False):
+def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
+               is_team_turn=False):
     """主 Agent 循环:一路跑到模型不再调用工具为止。"""
     tool_calls_since_todo = 0  # 连续未更新 todo 的工具调用数
     board_used = False         # 本会话是否动过持久任务板
@@ -198,7 +199,7 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),is_t
                 # hook returned a message → inject it and continue
                 messages.append({"role": "user", "content": force})
                 continue
-            if not is_term_turn:
+            if not is_team_turn:
                 MEMORY_MANAGER.extract_memories(messages)
                 MEMORY_MANAGER.consolidate_memories()
             return

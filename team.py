@@ -2,6 +2,7 @@
 """s13 Agent Teams:常驻队友、文件收件箱、共享任务认领与协作协议。"""
 import json
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,10 @@ RESERVED_TEAMMATE_NAMES = {"lead", "agent"}
 
 # IDLE 队友等待收件箱的时长:到点没消息就去扫一次任务板
 IDLE_SCAN_INTERVAL = 2.0
+
+# 任务隔离用的 worktree 目录;名字只允许字母数字点下划线短横,且必须字母数字开头
+WORKTREES_DIR = BASE_DIR / ".worktrees"
+VALID_WORKTREE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 # -- 全局状态:全部用 team_lock 保护 --
@@ -230,15 +235,76 @@ def advance_assignment_version(owner):
         plan_request_ids.pop(owner, None)
 
 
+def validate_worktree_name(name):
+    """校验 worktree 名字:格式合法、不叫 . / .. 、不含 ..。"""
+    if not VALID_WORKTREE_NAME.fullmatch(name or ""):
+        return ("worktree name must be 1-64 letters, digits, dots, "
+                "underscores, or dashes, and start with a letter or digit")
+    if name in {".", ".."} or ".." in name:
+        return "worktree name cannot contain '..'"
+    return None
+
+
+def worktree_path(name):
+    """把 worktree 名字解析成目录路径,越界就报错。"""
+    root = WORKTREES_DIR.resolve()
+    path = (WORKTREES_DIR / name).resolve()
+    if not path.is_relative_to(root) or path == root:
+        raise ValueError(f"Worktree path escapes directory: {name!r}")
+    return path
+
+
+def worktree_branch(name):
+    """worktree 对应的分支名。"""
+    return f"wt/{name}"
+
+
+def run_git(args, cwd=None):
+    """跑一条 git 命令,不做 shell 插值;返回 (是否成功, 输出)。"""
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=str(cwd or WORKDIR),
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
+        )
+    except Exception as error:
+        return False, f"{type(error).__name__}: {error}"
+    output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0, output.strip()
+
+
+def registered_worktrees():
+    """解析 `git worktree list --porcelain`,返回 {绝对路径: 条目}。"""
+    ok, output = run_git(["worktree", "list", "--porcelain"])
+    if not ok:
+        return {}, f"git worktree list failed: {output}"
+    entries = {}
+    current = {}
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            current = {"path": line[len("worktree "):].strip()}
+        elif line.startswith("branch "):
+            current["branch"] = line[len("branch "):].strip()
+        elif not line.strip() and current:
+            entries[Path(current["path"]).resolve()] = current
+            current = {}
+    if current:
+        entries[Path(current["path"]).resolve()] = current
+    return entries, None
+
+
 def task_worktree_cwd(task):
     """解析任务的工作目录;绑定不可用时返回错误而不是悄悄回退。"""
     if not task.worktree:
         return WORKDIR, None
-    # 阶段 6 会把这里换成 git 校验版本
-    path = (BASE_DIR / ".worktrees" / task.worktree).resolve()
-    if not path.is_dir():
-        return None, f"worktree '{task.worktree}' not found"
-    return path, None
+    entries, error = registered_worktrees()
+    if error:
+        return None, error
+    expected_branch = worktree_branch(task.worktree)
+    for path, entry in entries.items():
+        if entry.get("branch", "").endswith(expected_branch):
+            return path, None
+    return None, f"worktree '{task.worktree}' is not registered with git"
 
 
 def assignment_cwd(owner):
@@ -471,9 +537,14 @@ def teammate_run_tool(name, tool_name, arguments, handlers):
 class TeammateRuntime:
     """一个常驻队友:独立 messages,在 WORK / IDLE 之间循环。"""
 
+    # 一个工作项内连续调用工具的轮次上限。没有它,模型陷进"调工具→再调工具"
+    # 会把这个线程永远占住,而且一直烧 token
+    MAX_TURNS_PER_TASK = 40
+
     def __init__(self, name, role, prompt, task_id=None, require_plan=False):
         """拼好系统提示词、首批消息和工具表。"""
         self.name = name
+        self.turns_this_task = 0
         self.system = (
             f"You are '{name}', a {role}. Use tools to complete the assigned "
             "Task, then call complete_task and report a concise result. "
@@ -556,7 +627,11 @@ class TeammateRuntime:
             return f"Error: {error}"
 
     def tool_complete(self, task_id):
-        """完成本队友认领的任务。"""
+        """完成本队友认领的任务;计划未批时拒绝,防止没干活就收工。"""
+        gate = plan_gates.get(self.name, "not_required")
+        if gate in {"required", "pending", "rejected"}:
+            return (f"Cannot complete {task_id} while plan status is {gate}. "
+                    "Submit or revise the plan and wait for approval.")
         try:
             return complete_task(task_id, self.name)
         except (FileNotFoundError, ValueError) as error:
@@ -632,6 +707,7 @@ class TeammateRuntime:
         self.messages.append(assistant_message)
 
         if tool_calls:
+            self.turns_this_task += 1
             for tool_call in tool_calls:
                 try:
                     arguments = parse_json(tool_call.function.arguments)
@@ -649,6 +725,16 @@ class TeammateRuntime:
                     "tool_call_id": tool_call.id,
                     "content": output,
                 })
+            if self.turns_this_task >= self.MAX_TURNS_PER_TASK:
+                # 不释放 assignment:任务还是它的,等 Lead 给指示再继续
+                BUS.send(self.name, "lead",
+                         f"Paused after {self.turns_this_task} consecutive tool "
+                         "turns on the current task without finishing.", "error")
+                with team_lock:
+                    active_teammates[self.name] = "idle"
+                BUS.send(self.name, "lead", "Waiting for guidance.",
+                         "idle_notification")
+                return "idle"
             return "continue"
 
         summary = (message.content or "").strip()
@@ -660,6 +746,7 @@ class TeammateRuntime:
                 active_teammates[self.name] = "waiting_approval"
         else:
             release_completed_assignment(self.name)
+            self.turns_this_task = 0
             with team_lock:
                 active_teammates[self.name] = "idle"
             BUS.send(self.name, "lead", "Waiting for more work.",
@@ -675,11 +762,14 @@ class TeammateRuntime:
                 if self.handle_inbox(inbox):
                     return False
                 if len(self.messages) > before:
+                    # 新工作项:轮次预算重新计数
+                    self.turns_this_task = 0
                     return True
                 continue
             task = claim_next_task(self.name)
             if task is None:
                 continue
+            self.turns_this_task = 0
             cwd = assignment_cwd(self.name)
             self.messages.append({
                 "role": "user",
@@ -848,5 +938,79 @@ def run_review_plan(request_id, approve, feedback=""):
 
 
 def run_create_worktree(name, task_id):
-    """Lead 工具:为任务创建并绑定 worktree(阶段 6 才实现)。"""
-    return "Error: worktree support is not enabled (see stage 6)."
+    """Lead 工具:先校验全部输入,再建 worktree,最后才写任务绑定。"""
+    error = validate_worktree_name(name)
+    if error:
+        return f"Error: {error}"
+    try:
+        path = worktree_path(name)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    branch = worktree_branch(name)
+    with task_store_lock():
+        task = TASKS.load(task_id)
+        if task.status != "pending":
+            return f"Error: task {task_id} is {task.status}, cannot bind a worktree"
+        if task.owner is not None:
+            return f"Error: task {task_id} is already claimed"
+        if task.worktree:
+            return f"Error: task {task_id} already has worktree '{task.worktree}'"
+        if path.exists():
+            return f"Error: worktree path already exists: {path}"
+        existing, list_error = registered_worktrees()
+        if list_error:
+            return f"Error: {list_error}"
+        if path in existing:
+            return f"Error: worktree path is already registered with git"
+
+        created, output = run_git(["worktree", "add", "-b", branch, str(path)])
+        if not created:
+            # git 可能已经把分支或 checkout 留下了一半:如实报告,不清扫
+            return (f"Error: git worktree add failed (partial operation "
+                    f"possible, inspect {path} and branch {branch}): {output}")
+
+        task.worktree = name
+        TASKS.save(task)
+    print(f"  [worktree] {name} -> {path} (branch {branch})")
+    return (
+        f"Created worktree '{name}' at {path} on branch {branch}, "
+        f"bound to {task_id}"
+    )
+
+
+def remove_worktree(name, discard_changes=False):
+    """宿主函数:只在用户明确确认后调用,成功后清空任务绑定。"""
+    error = validate_worktree_name(name)
+    if error:
+        return f"Error: {error}"
+    try:
+        path = worktree_path(name)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    with task_store_lock():
+        for task in TASKS.list():
+            if task.worktree != name:
+                continue
+            if task.status != "completed":
+                return (f"Error: task {task.id} is {task.status}; finish or "
+                        "release it before removing the worktree")
+        for owner, assignment in teammate_assignments.items():
+            if assignment.get("cwd") and Path(assignment["cwd"]) == path:
+                return f"Error: worktree '{name}' is still leased by {owner}"
+
+    args = ["worktree", "remove"]
+    if discard_changes:
+        args.append("--force")
+    args.append(str(path))
+    removed, output = run_git(args)
+    if not removed:
+        return (f"Error: git worktree remove failed (uncommitted or untracked "
+                f"changes may be blocking it): {output}")
+
+    with task_store_lock():
+        for task in TASKS.list():
+            if task.worktree == name:
+                task.worktree = None
+                TASKS.save(task)
+    # 分支 wt/<name> 故意保留在仓库里,包括干净的本地提交
+    return f"Removed worktree '{name}'; branch '{worktree_branch(name)}' is kept"
