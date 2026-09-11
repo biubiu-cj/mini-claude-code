@@ -1,0 +1,24 @@
+# 密钥:绝对不能入库
+.env
+
+# 虚拟环境与字节码
+.venv/
+__pycache__/
+*.py[cod]
+
+# Agent 运行时产生的状态(会随每次会话变化)
+.tasks/
+.mailboxes/
+.worktrees/
+.transcripts/
+.task_outputs/
+.scheduled_tasks.json
+
+# 本机专属设置
+.claude/settings.local.json
+*.local.json
+*.bak
+
+# 编辑器
+.vscode/
+.idea/
