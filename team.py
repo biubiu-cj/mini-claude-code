@@ -3,6 +3,7 @@
 import json
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -10,7 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from config import BASE_DIR, MODEL, WORKDIR, client
 from hooks import trigger_hooks
-from permissions import set_interactive_allowed
+from permissions import delete_sandbox, set_interactive_allowed
+from prompts import SHELL_RULES
 from taskboard import TASKS, task_store_lock
 from tool_handlers import (
     claim_task,
@@ -23,7 +25,7 @@ from tool_handlers import (
     run_write,
 )
 from toolschema import TEAMMATE_TOOLS
-from util import clean_text, parse_json
+from util import clean_text, parse_json, set_agent_label
 
 
 # -- 常量 --
@@ -300,9 +302,11 @@ def task_worktree_cwd(task):
     entries, error = registered_worktrees()
     if error:
         return None, error
-    expected_branch = worktree_branch(task.worktree)
+    # 比较完整 ref:用 endswith("wt/<name>") 会让 refs/heads/abcwt/<name>
+    # 也匹配上,把别的 worktree 认成自己的
+    expected_ref = f"refs/heads/{worktree_branch(task.worktree)}"
     for path, entry in entries.items():
-        if entry.get("branch", "").endswith(expected_branch):
+        if entry.get("branch", "") == expected_ref:
             return path, None
     return None, f"worktree '{task.worktree}' is not registered with git"
 
@@ -555,6 +559,7 @@ class TeammateRuntime:
             "working directory; that directory is not a sandbox. The runtime "
             "delivers your final text to Lead. Use send_message only for "
             "intermediate coordination, and address the coordinator as 'lead'."
+            f"\n\n{SHELL_RULES}"
         )
         self.messages = [
             {"role": "system", "content": self.system},
@@ -595,9 +600,12 @@ class TeammateRuntime:
             return None, f"Error: Invalid task assignment: {error}"
 
     def tool_bash(self, command,run_in_background=False):
-        """在任务目录里执行 shell 命令。"""
+        """在任务目录里执行 shell 命令;删除只允许发生在自己 worktree 内。"""
         cwd, error = self.current_cwd()
-        return error or run_bash(command, cwd=cwd)
+        if error:
+            return error
+        with delete_sandbox(cwd):
+            return run_bash(command, cwd=cwd)
 
     def tool_read(self, path, limit=None):
         """读取任务目录里的文件。"""
@@ -784,6 +792,7 @@ class TeammateRuntime:
     def run(self):
         """队友线程主体:WORK / IDLE 循环,直到关机或异常。"""
         set_interactive_allowed(False)
+        set_agent_label(self.name)
         try:
             state = "continue"
             while state != "stop":
@@ -1014,3 +1023,86 @@ def remove_worktree(name, discard_changes=False):
                 TASKS.save(task)
     # 分支 wt/<name> 故意保留在仓库里,包括干净的本地提交
     return f"Removed worktree '{name}'; branch '{worktree_branch(name)}' is kept"
+
+
+#——————————————————————————————————————————————————————————————
+# 宿主 CLI:remove_worktree 是破坏性操作,不注册成模型工具,
+# 由这个入口在会话外由人确认后调用。
+def worktree_report():
+    """列出所有 worktree 及其任务绑定状态,每行一条。"""
+    entries, error = registered_worktrees()
+    if error:
+        return [f"  ERROR: {error}"]
+
+    registered = {path.name: path for path in entries}
+    root = WORKTREES_DIR.resolve()
+    lines = []
+    bound = set()
+
+    for task in TASKS.list():
+        if not task.worktree:
+            continue
+        bound.add(task.worktree)
+        state = "git ok" if task.worktree in registered else "NOT registered with git"
+        lines.append(
+            f"  {task.worktree:<16} -> {task.id} ({task.status}) [{state}]"
+        )
+
+    for name, path in sorted(registered.items()):
+        if name not in bound and path.parent == root:
+            lines.append(f"  {name:<16} -> (no task bound) [orphan]")
+
+    return lines
+
+
+def confirm(prompt):
+    """问一个 y/N 问题;非交互环境(EOF)按拒绝处理。"""
+    try:
+        return input(prompt).strip().lower() in {"y", "yes"}
+    except EOFError:
+        return False
+
+
+def host_cli(argv):
+    """宿主 CLI:list 查看 worktree,rm 拆除一个。返回退出码。"""
+    if not argv or argv[0] in {"-h", "--help", "help"}:
+        print("usage: python team.py list")
+        print("       python team.py rm <name> [--force]")
+        return 0
+
+    if argv[0] == "list":
+        lines = worktree_report()
+        print("\n".join(lines) if lines else "  (no worktrees)")
+        return 0
+
+    if argv[0] == "rm":
+        if len(argv) not in {2, 3} or (len(argv) == 3 and argv[2] != "--force"):
+            print("usage: python team.py rm <name> [--force]")
+            return 1
+        name = argv[1]
+        force = len(argv) == 3
+        try:
+            path = worktree_path(name)
+        except ValueError as error:
+            print(f"Error: {error}")
+            return 1
+        # 跨进程时看不到别的进程的内存租约,只能靠任务状态(磁盘)兜底:
+        # 任务没 completed 会被 remove_worktree 拒绝
+        print(f"  Remove worktree '{name}' at {path}")
+        print(f"  Branch '{worktree_branch(name)}' is kept.")
+        if not confirm("  Confirm [y/N] "):
+            print("  Aborted.")
+            return 1
+        result = remove_worktree(name, discard_changes=force)
+        print(result)
+        if result.startswith("Removed "):
+            print("  Task binding cleared.")
+            return 0
+        return 1
+
+    print(f"Unknown command: {' '.join(argv)}")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(host_cli(sys.argv[1:]))

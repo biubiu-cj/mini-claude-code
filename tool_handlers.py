@@ -6,6 +6,7 @@ from background_task import BACKGROUND
 from config import WORKDIR
 from skill_loader import SKILL_LOADER
 from taskboard import TASKS
+from util import log_tag
 
 
 def safe_path(path, cwd=None):
@@ -20,7 +21,7 @@ def safe_path(path, cwd=None):
 #执行bash
 def run_bash(command, cwd=None):
     """在指定目录执行 shell 命令,默认仓库根目录;超时 30 秒。"""
-    print(f"\n[Tool] {command}")
+    print(f"\n{log_tag()}[Tool] {command}")
 
     try:
         result = subprocess.run(

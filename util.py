@@ -1,5 +1,26 @@
 import json
 import re
+import threading
+
+
+# 当前线程的 agent 标签。队友和 lead 是并发跑的,共用一个 print,
+# 日志不带标签就没法归因是哪个 agent 干的。
+_agent_label = threading.local()
+
+
+def set_agent_label(label):
+    """设置当前线程的 agent 标签(lead 不设置,默认 main)。"""
+    _agent_label.name = label
+
+
+def agent_label():
+    """取当前线程的 agent 标签,未设置时当作 main。"""
+    return getattr(_agent_label, "name", "main")
+
+
+def log_tag():
+    """日志前缀,形如 `[alice] `。"""
+    return f"[{agent_label()}] "
 
 
 # 解析模型返回的 JSON,兼容被 ```json ... ``` 围栏包裹的情况

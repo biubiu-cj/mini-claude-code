@@ -1,6 +1,28 @@
 from skill_loader import SKILL_LOADER
 
 
+# lead / 子 agent / 队友三个提示词共用的 shell 规则。
+# 关键事实:bash 工具在 Windows 上走的是 cmd.exe,不是 bash。
+# `mkdir -p X` 在 cmd 里不是"建目录并忽略已存在",而是**真的建出一个名为 -p 的目录**,
+# 静默污染工作区(实测过);`ls`/`cat`/`head`/`grep`/`rm` 同样不存在。
+SHELL_RULES = """You are running on Windows, and the bash tool executes through
+cmd.exe, not bash. Write cmd commands:
+
+- mkdir already creates intermediate directories, so use `mkdir a\\b`. Never use
+  `mkdir -p a`: cmd does not know `-p`, and it will create a real directory named
+  `-p` next to `a`, polluting the workspace.
+- ls, cat, head, tail, grep, rm and cp do not exist. Use dir, type, more,
+  findstr, del and copy instead.
+- Chain commands with `&&` or `&`; switch drives with `cd /d <path>`.
+- Do not use bash-only syntax: heredocs (`<<`), `$VAR`, or single-quote quoting.
+- To run Python use `py`, not `python`: a bare `python` on this machine is a Windows
+  Store placeholder that silently does nothing, and a task worktree has no .venv.
+- Generated files (__pycache__ and similar) are gitignored. Inside your own working
+  directory you may remove them with a relative path (`rmdir /s /q __pycache__`);
+  anything absolute, UNC, or containing `..` is refused. Otherwise ignore them."""
+
+
+
 def memory_block(relevant_memories) -> str:
     """把召回的 memory 渲染成一段只读背景说明。"""
     if not relevant_memories:
@@ -36,9 +58,7 @@ def build_system_prompt(relevant_memories, todo_text="") -> str:
     return f"""
 You are a coding agent.
 
-You are running on Windows.
-Use Windows commands when using bash.
-Do not use Linux commands such as ls, cat, grep, or head.
+{SHELL_RULES}
 
 ## Tools
 
@@ -82,9 +102,18 @@ These are two layers, not two options:
   (blocked_by) and an owner. It is persisted, so it outlives this conversation and
   is shared with subagents.
 
-Use the task graph when the request is a project to decompose: several work items,
-real ordering between them, or work that will span sessions or agents. Use
-todo_write for the steps inside whichever item you are working on.
+Decide with two questions:
+
+1. Does the work need more than one agent at once, or must it survive this
+   session? If yes, it is a task-graph job: create the tasks with create_task
+   before you start.
+2. Can you finish it yourself, in this session? If yes, skip the graph. Do not
+   create tasks for work you will finish in one turn.
+
+todo_write is NOT the alternative to the graph — it is always required for
+multi-step work (see the RULE below). When you do build a graph, the graph is the
+project breakdown and todo_write is the step list inside the item you are working
+on right now. Never mirror the whole graph into todo_write.
 
 A task with unmet dependencies cannot be claimed, so record dependencies before
 you start, and keep the graph in sync as work completes.
@@ -170,9 +199,7 @@ You are a subagent working under a parent coding agent.
 
 Your job is to independently investigate and complete the task given by the parent agent.
 
-You are running on Windows.
-Use Windows commands when using bash.
-Do not use Linux commands such as ls, cat, grep, or head.
+{SHELL_RULES}
 
 ## Tools
 

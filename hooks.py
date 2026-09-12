@@ -1,5 +1,6 @@
 from config import WORKDIR
 from permissions import check_permission
+from util import log_tag
 
 
 #HOOK表
@@ -45,14 +46,14 @@ def permission_hook(tool_call, arguments):
     return None
 
 def log_hook(tool_call, arguments):
-    """把每次工具调用打到日志上。"""
-    print(f"[HOOK] {tool_call.function.name}(...)")
+    """把每次工具调用打到日志上,带 agent 标签以便并发时归因。"""
+    print(f"{log_tag()}[HOOK] {tool_call.function.name}(...)")
 
 #判断是否过大
 def large_output_hook(tool_call, arguments, output):
     """工具输出超过 10 万字符时提醒一次。"""
     if len(str(output)) > 100000:
-        print(f"[HOOK] [!] Large output from {tool_call.function.name}")
+        print(f"{log_tag()}[HOOK] [!] Large output from {tool_call.function.name}")
 
 
 #统计对话过程中用了多少次工具

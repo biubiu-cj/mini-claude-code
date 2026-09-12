@@ -1,5 +1,6 @@
 import re
 import threading
+from contextlib import contextmanager
 
 from config import WORKDIR
 
@@ -18,6 +19,43 @@ def interactive_allowed() -> bool:
     return getattr(_confirm_allowed, "value", True)
 
 
+# 队友的删除沙箱。队友线程没有终端可确认,而"删除意图"一律要确认,
+# 结果它连自己 worktree 里跑 Python 生成的 __pycache__ 都清不掉,白烧轮次。
+# 这里开一条窄路:沙箱路径由运行时给(队友当前任务的 worktree),命令只要
+# 无法跳出这个目录就自动放行。lead 主线程不设沙箱,行为完全不变。
+_delete_sandbox = threading.local()
+
+# 命中任意一条就认为命令可能跳出沙箱。刻意保守:宁可多拒,不可放过。
+# cmd 的开关是 `/`、根相对路径是 `\`,所以只拦 `\` 开头的 token。
+_CAN_ESCAPE = re.compile(
+    r"\.\."                      # 上级目录
+    r"|[a-zA-Z]:[\\/]"           # 盘符绝对路径
+    r"|(?:^|[\s;&|])\\+"         # UNC \\server 或根相对路径 \Windows
+    r"|%[^%\s]+%"                # %VAR% 展开
+    r"|\$\{?[A-Za-z_]"           # $VAR 展开
+)
+
+
+@contextmanager
+def delete_sandbox(path):
+    """把当前线程的删除沙箱临时设为 path,退出时恢复原值。"""
+    previous = getattr(_delete_sandbox, "path", None)
+    _delete_sandbox.path = path
+    try:
+        yield
+    finally:
+        _delete_sandbox.path = previous
+
+
+def sandbox_allows_delete(command: str) -> bool:
+    """命令是否是一条跑在沙箱内、且无法逃逸的相对删除。"""
+    if getattr(_delete_sandbox, "path", None) is None:
+        return False
+    if not has_delete_intent(command):
+        return False
+    return not _CAN_ESCAPE.search(command)
+
+
 # ---------- 危险命令检测:三级 ----------
 # 红:整机 / 整盘级破坏 → 直接拒绝
 # 黄:删除文件 → 询问用户
@@ -25,8 +63,14 @@ def interactive_allowed() -> bool:
 
 # 红名单:只匹配真正毁灭性的命令
 CATASTROPHIC_PATTERNS = [
-    r"(?i)\brm\s+-[a-z]*[rf][a-z]*\b.*(?:/|~|[a-z]:[\\/])",  # rm -rf / 等
-    r"(?i)\b(?:rd|rmdir)\s+/s\b.*[a-z]:[\\/]",               # rd /s C:\
+    # rm -rf 只在**目标本身**是根/绝对/盘符/上级/环境变量时才算灾难。
+    # 原来用 `.*` 让 `/` 出现在任意位置,于是 `rm -rf ./-p`、`rm -rf ./build`
+    # 这种正常的相对清理也被误判成灾难(实测被拦过)。允许前置任意 `-x` 标志,
+    # 所以 `rm -rf --no-preserve-root /` 仍然会被拦下。
+    r"(?i)\brm\s+(?:-[a-z0-9-]+\s+)*(?:/|~|\.\.|\$|[a-z]:[\\/])",  # rm -rf / 等
+    # rd /s 只在**目标是盘根**时才算灾难;`rd /s /q D:\path\dir` 是正常清理目录。
+    # 和上面 rm 同理:用 `.*` 会把任何盘符路径都误判成"删盘"(实测拦过 __pycache__ 清理)。
+    r"(?i)\b(?:rd|rmdir)\s+(?:/[a-z]\s+)*[a-z]:[\\/]?\s*(?:$|[&|])",  # rd /s C:\
     r"(?i)\bRemove-Item\b[^;&|\n]*-Recurse\b[^;&|\n]*[a-z]:[\\/]",  # 递归删盘
     r"(?i)\bformat\s+[a-z]:",                                # format C:
     r"(?i)\b(?:diskpart|mkfs|shutdown|reboot|stop-computer|restart-computer)\b",
@@ -86,6 +130,13 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
     return "allow" if choice in ("y", "yes") else "deny"
 
 
+def report_command(tool_name: str, arguments: dict) -> str:
+    """把一次调用压成一行短文本,用于日志里看清被拦下的到底是什么。"""
+    if tool_name == "bash":
+        return str(arguments.get("command", ""))[:200]
+    return f"{tool_name}({arguments})"[:200]
+
+
 #总校验命令是否合法
 def check_permission(tool_call, arguments) -> bool:
     """总闸门:红名单直接拒绝,黄名单问用户,其余放行。"""
@@ -94,14 +145,21 @@ def check_permission(tool_call, arguments) -> bool:
     # 红:整机 / 整盘级破坏 → 直接拒绝,不弹窗
     if tool_name == "bash" and is_catastrophic(arguments.get("command", "")):
         print("\n[!]  Catastrophic command blocked")
+        print(f"   Blocked command: {report_command(tool_name, arguments)}")
         return False
 
     # 黄:删除 / 越界访问等 → 询问用户
     reason = check_rules(tool_name, arguments)
     if reason:
+        # 队友在自己的任务 worktree 里做相对删除:没有终端可确认,放行。
+        # 逃逸风险由 sandbox_allows_delete 的保守检查兜住;lead 不设沙箱,不受影响。
+        if tool_name == "bash" and sandbox_allows_delete(arguments.get("command", "")):
+            return True
         if not interactive_allowed():
-            # 定时回合在后台线程:拒绝交互确认,避免和主终端抢输入
-            print(f"\n[!]  {reason} - auto denied in scheduled turn")
+            # 定时回合、队友线程和无人值守驱动都在后台,不能和主终端抢 input();
+            # 这里无条件拒绝,并把命令原文打出来,否则日志里看不出被拦的是哪条
+            print(f"\n[!]  {reason} - auto denied (no interactive approver here)")
+            print(f"   Blocked command: {report_command(tool_name, arguments)}")
             return False
         decision = ask_user(tool_name, arguments, reason)
         if decision == "deny":

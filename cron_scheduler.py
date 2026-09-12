@@ -13,7 +13,6 @@ from config import BASE_DIR
 @dataclass
 class CronJob:
     """定时任务:定义(何时跑、跑什么)加交付状态。"""
-
     id: str                        # 定时任务的唯一 ID
     cron: str                      # Cron 表达式,决定任务什么时候触发
     prompt: str                    # 到时间后交给 Agent 执行的任务描述

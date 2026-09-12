@@ -112,7 +112,6 @@ if __name__ == "__main__":
     # stdin 从后台线程读,主线程才腾得出来等收件箱
     threading.Thread(target=stdin_reader, daemon=True).start()
 
-    print("\nEnter your query (exit to quit):")
     session_messages = None
     session_todo = None
     session_memories = ()
