@@ -42,3 +42,20 @@ BASE_DIR = Path(__file__).resolve().parent
 # 任务归属身份:由运行时注入,不由模型提供。
 # 模型自己填的 owner 不构成任何约束,父/子 agent 都填默认值会让归属检查形同虚设
 MAIN_OWNER = "main"
+
+# 出错重试:429(限流)和 529(过载)都按指数退避重试
+MAX_RETRIES = 4
+
+# 连续这么多次 529 之后,切到备用模型
+MAX_CONSECUTIVE_529 = 2
+
+# 备用模型;留空表示不切
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID", "")
+
+# 每次调模型的输出上限,以及"顶到上限"后升级到多少
+DEFAULT_MAX_TOKENS = 8000
+ESCALATED_MAX_TOKENS = 16000
+
+# 升级之后仍然顶到上限,最多再要求模型"继续写"几次;
+# 没有这个上限就会无限 continue(模型每次都在写长输出时死循环)
+MAX_RECOVERY_RETRIES = 3

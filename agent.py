@@ -1,17 +1,26 @@
+from dataclasses import dataclass
 import json
 import os
+import time
 
 from background_task import BACKGROUND, should_run_background
 from compaction import COMPACTOR
 from config import (
+    DEFAULT_MAX_TOKENS,
+    ESCALATED_MAX_TOKENS,
+    FALLBACK_MODEL,
     MAIN_OWNER,
+    MAX_CONSECUTIVE_529,
+    MAX_RECOVERY_RETRIES,
+    MAX_RETRIES,
     MODEL,
     PLAN_CHECK_EVERY,
     REMINDER_EVERY,
     client,
 )
-from cron_scheduler import consume_cron_queue, save_durable_jobs
+from cron_scheduler import consume_cron_queue, list_crons, save_durable_jobs
 from hooks import trigger_hooks
+from mcp_client import assemble_tool_pool, run_connect_mcp
 from memory import MEMORY_MANAGER
 from prompts import build_sub_system_prompt, build_system_prompt
 from team import run_create_worktree, run_list_teammates, run_request_plan, run_request_shutdown, run_review_plan, run_send_message, run_spawn_teammate
@@ -23,16 +32,18 @@ from tool_handlers import (
     get_task,
     list_tasks,
     run_bash,
+    run_cancel_cron,
     run_edit,
     run_glob,
     run_load_skill,
     run_read,
+    run_schedule_cron,
     run_todo_write,
     run_write,
     start_background_task,
     update_task,
 )
-from toolschema import SUB_TOOLS, TOOLS
+from toolschema import SUB_TOOLS
 from util import clean_text, parse_json
 
 
@@ -98,6 +109,57 @@ def refresh_system_prompt(messages, build, relevant_memories, todo_text):
         system["content"] = build(relevant_memories, todo_text)
 
 
+@dataclass
+class RecoveryState:
+    """一次 agent 轮次内的恢复状态:max_tokens 升级、529 计数、继续写次数。"""
+    has_escalated: bool = False
+    consecutive_529: int = 0
+    recovery_count: int = 0
+
+
+def retry_delay(attempt):
+    """指数退避的等待秒数。"""
+    return min(2 ** attempt, 30)
+
+
+def call_model(messages, tools, state, max_tokens):
+    """带恢复的模型调用:429/529 退避重试,必要时切备用模型。"""
+    model = MODEL
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.chat.completions.create(
+                model=model, messages=messages, tools=tools,
+                tool_choice="auto", max_tokens=max_tokens,
+            )
+            state.consecutive_529 = 0
+            return response
+        except Exception as error:
+            text = str(error).lower()
+            if "429" in text or "rate limit" in text or "ratelimit" in text:
+                kind = "429"
+            elif "529" in text or "overloaded" in text:
+                kind = "529"
+                state.consecutive_529 += 1
+                if state.consecutive_529 >= MAX_CONSECUTIVE_529 and FALLBACK_MODEL:
+                    model = FALLBACK_MODEL
+                    state.consecutive_529 = 0
+                    print(f"\n[529] switching to {FALLBACK_MODEL}")
+            else:
+                raise
+            # 重试耗尽就抛出**原始**错误:套一层笼统的 RuntimeError 会把
+            # 429 / 529 的区分盖掉,日志里就看不出真实原因
+            if attempt == MAX_RETRIES - 1:
+                raise
+            delay = retry_delay(attempt)
+            print(f"\n[{kind}] retry {attempt + 1}/{MAX_RETRIES} in {delay:.0f}s")
+            time.sleep(delay)
+    # 只有 MAX_RETRIES <= 0 才会走到这里
+    raise RuntimeError(f"model call failed after {MAX_RETRIES} attempts")
+
+
+
+
+
 #agent loop
 def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
                is_team_turn=False):
@@ -107,6 +169,8 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
     pending_checkin = False  # 刚注入自检提醒:下一轮纯文本是应答,不是任务完成
     bg_stop_nudged = False  # 退出前已提醒过"后台任务还在跑"
     reactive_retries = 0 #补救次数
+    state = RecoveryState() #恢复状态
+    max_tokens = DEFAULT_MAX_TOKENS
     while True:
         # 每轮先把当前计划刷进 system 消息,让它扛得住压缩
         refresh_system_prompt(
@@ -117,10 +181,19 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
         inject_background_results(messages)
         inject_cron_jobs(messages)
         try:
-            response = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=TOOLS, tool_choice="auto",
-            )
-            # 请求成功，重置补救次数
+            tools, handlers = assemble_tool_pool(TOOL_HANDLERS)
+        except ValueError as error:
+            # 工具池组装失败(撞名/超长/非法 schema)是配置问题:
+            # 报出来并结束本轮,不要让整个 CLI 崩掉
+            print(f"\n[MCP] tool pool error: {error}")
+            messages.append({
+                "role": "assistant",
+                "content": f"[MCP tool pool error] {error}",
+            })
+            return
+        try:
+            response = call_model(messages, tools, state, max_tokens)
+            # 请求成功，重置上下文过长的补救次数
             reactive_retries = 0
         except Exception as error:
             error_message = str(error).lower()
@@ -129,14 +202,41 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
                 or "too many tokens" in error_message
                 or "context length" in error_message
             )
-
-            if (too_long and reactive_retries < 1):
+            if too_long and reactive_retries < 1:
                 print("[context too long, reactive compact]")
                 messages = COMPACTOR.reactive_compact(messages, active_request)
                 reactive_retries += 1
                 # 压缩之后重新调用模型
                 continue
             raise
+        # 模型生成达到 max_tokens 上限
+        if response.choices[0].finish_reason == "length":
+            if not state.has_escalated:
+                # 第一次:丢掉这段被截断的输出,用更大的预算重跑
+                state.has_escalated = True
+                max_tokens = ESCALATED_MAX_TOKENS
+                print(f"\n[max_tokens] escalating to {max_tokens}")
+                continue
+            # 已经升过级还顶到上限:必须先把这段被截断的输出留下。
+            # 否则模型收到"接着写",上下文里却没有它自己写过什么,无从继续。
+            messages.append({
+                "role": "assistant",
+                "content": response.choices[0].message.content or "",
+            })
+            if state.recovery_count >= MAX_RECOVERY_RETRIES:
+                # 兜底上限:没有它,模型只要一直在写长输出就会无限 continue
+                print(f"\n[max_tokens] gave up after "
+                      f"{MAX_RECOVERY_RETRIES} continuations")
+                return
+            state.recovery_count += 1
+            messages.append({
+                "role": "user",
+                "content": "Continue exactly where you left off.",
+            })
+            continue
+        # 正常响应:复位,下次再溢出还能重新升级
+        max_tokens = DEFAULT_MAX_TOKENS
+        state.has_escalated = False
         message = response.choices[0].message
         tool_calls = message.tool_calls
 
@@ -210,7 +310,18 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
         # 模型又在干活了(sleep 等结果也算),下次退出时允许再提醒一次
         bg_stop_nudged = False
 
+        compact_requested = False
         for tool_call in tool_calls:
+            # compact 是循环级动作,不走 handler:先回占位结果保住配对,
+            # 等整轮结果都追加完再压缩(否则会丢掉这条 assistant 消息,API 报 400)
+            if tool_call.function.name == "compact":
+                compact_requested = True
+                messages.append({
+                    "role": "tool", "tool_call_id": tool_call.id,
+                    "content": "[Compaction requested. This completed turn "
+                               "will be summarized.]",
+                })
+                continue
             try:
                 arguments = parse_json(tool_call.function.arguments)
             except (json.JSONDecodeError, TypeError) as error:
@@ -235,7 +346,13 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
             # run_in_background 是给 loop 的标志,消费后不传给 handler
             background_call = should_run_background(tool_name, arguments)
             arguments.pop("run_in_background", None)
-            handler = TOOL_HANDLERS[tool_name]
+            handler = handlers.get(tool_name)
+            if handler is None:
+                messages.append({
+                    "role": "tool", "tool_call_id": tool_call.id,
+                    "content": f"Error: unknown tool {tool_name}",
+                })
+                continue
             # TodoManager 是 Agent 运行时内部状态,不由 LLM 传入;
             # 只对 todo_write 注入当前 Agent 的实例,其余工具签名不变
             try:
@@ -267,6 +384,11 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
             messages.append({
                 "role": "tool", "tool_call_id": tool_call.id, "content": output,
             })
+
+        if compact_requested:
+            # 必须切片赋值就地替换:agent_loop 的 messages 每轮会被
+            # COMPACTOR.prepare 重新绑定,直接赋值只改局部名字,调用方看不到
+            messages[:] = COMPACTOR.compact_history(messages, active_request)
 
         # 一轮结束:用独立 user 消息提醒(以独立消息推送比拼在工具 output
         # 末尾可靠得多)。分两种场景:
@@ -471,6 +593,11 @@ TOOL_HANDLERS = {
     "request_plan": run_request_plan,
     "review_plan": run_review_plan,
     "create_worktree": run_create_worktree,
+
+    "connect_mcp": run_connect_mcp,
+    "schedule_cron": run_schedule_cron,
+    "list_crons": list_crons,
+    "cancel_cron": run_cancel_cron,
 }
 
 # 子 agent 的白名单直接由 SUB_TOOLS 推导:工具列表和 handler 表不会各改一处而错位。

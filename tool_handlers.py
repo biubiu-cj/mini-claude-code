@@ -2,11 +2,18 @@ import json
 import subprocess
 from dataclasses import asdict
 
-from background_task import BACKGROUND
+from background_task import BACKGROUND, kill_process_tree
 from config import WORKDIR
 from skill_loader import SKILL_LOADER
 from taskboard import TASKS
 from util import log_tag
+from cron_scheduler import (
+    cancel_cron,
+    consume_cron_queue,
+    list_crons,
+    save_durable_jobs,
+    schedule_cron,
+)
 
 
 def safe_path(path, cwd=None):
@@ -22,22 +29,27 @@ def safe_path(path, cwd=None):
 def run_bash(command, cwd=None):
     """在指定目录执行 shell 命令,默认仓库根目录;超时 30 秒。"""
     print(f"\n{log_tag()}[Tool] {command}")
-
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(cwd or WORKDIR),
+    )
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=30,
-            cwd=str(cwd or WORKDIR),
-        )
-
-        output = result.stdout
-
-        if result.stderr:
-            output += result.stderr
-
+        stdout, stderr = process.communicate(timeout=30)
+        output = stdout
+        if stderr:
+            output += stderr
         return output
-
+    except subprocess.TimeoutExpired:
+        kill_process_tree(process)
+        return "Command timed out after 30 seconds."
     except Exception as e:
+        kill_process_tree(process)
         return str(e)
 
 
@@ -193,3 +205,18 @@ def complete_task(task_id: str, owner: str) -> str:
     if unblocked:
         message += "\nUnblocked: " + ", ".join(unblocked)
     return message
+
+
+def run_schedule_cron(cron, prompt, recurring=True, durable=False):
+    """Agent 工具 schedule_cron:建定时任务,返回可读的任务 id。"""
+    job_id = schedule_cron(cron, prompt, recurring=recurring, durable=durable)
+    kept = "recurring" if recurring else "one-shot"
+    persistence = "durable" if durable else "in-memory"
+    return f"Scheduled {job_id} ({kept}, {persistence}): {cron} -> {prompt}"
+
+
+def run_cancel_cron(job_id):
+    """Agent 工具 cancel_cron:把布尔翻成人话,否则工具结果是 'True'。"""
+    if cancel_cron(job_id):
+        return f"Cancelled {job_id}"
+    return f"No scheduled job with id {job_id}"

@@ -492,4 +492,83 @@ TEAMMATE_TOOLS = [
 # 多 agent 协作建立在共享的任务图之上
 SUB_TOOLS = [*BASE_TOOLS, *TASK_SYSTEM_TOOLS]
 
-TOOLS = [*BASE_TOOLS, *TASK_SYSTEM_TOOLS, TASK_TOOL, *TEAM_TOOLS]
+# MCP 连接入口:必须是内置工具,否则模型永远迈不出第一步(鸡生蛋)。
+# 只并入 TOOLS(lead),不进 SUB_TOOLS / TEAMMATE_TOOLS —— MCP 只给 lead。
+CONNECT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "connect_mcp",
+        "description": "Connect to an MCP server and discover its tools.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "enum": ["docs", "deploy"]},
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+
+# 定时任务:运行时早就写好了,这里只是把入口交给模型
+CRON_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_cron",
+            "description": (
+                "Schedule a prompt to run later. The cron expression has five "
+                "fields: minute hour day month weekday (e.g. '30 14 * * *'). "
+                "Set durable=true to survive a restart."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cron": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "recurring": {"type": "boolean"},
+                    "durable": {"type": "boolean"},
+                },
+                "required": ["cron", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_crons",
+            "description": "List all scheduled jobs.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_cron",
+            "description": "Cancel a scheduled job by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+            },
+        },
+    },
+]
+
+COMPACT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "compact",
+        "description": (
+            "Summarize earlier conversation and continue with compacted "
+            "context. Use when the context is getting long."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"focus": {"type": "string"}},
+        },
+    },
+}
+
+TOOLS = [*BASE_TOOLS, *TASK_SYSTEM_TOOLS, TASK_TOOL, *TEAM_TOOLS,
+         CONNECT_TOOL, *CRON_TOOLS, COMPACT_TOOL]

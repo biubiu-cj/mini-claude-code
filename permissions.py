@@ -3,7 +3,7 @@ import threading
 from contextlib import contextmanager
 
 from config import WORKDIR
-
+from mcp_client import mcp_policy_for
 
 # 当前线程是否允许交互确认:定时回合跑在后台线程,不能和主终端抢 stdin
 _confirm_allowed = threading.local()
@@ -147,6 +147,20 @@ def check_permission(tool_call, arguments) -> bool:
         print("\n[!]  Catastrophic command blocked")
         print(f"   Blocked command: {report_command(tool_name, arguments)}")
         return False
+
+    # MCP 外部工具:授权只看宿主策略。server 自报的 readOnlyHint 不是授权依据,
+    # 策略表里没有的一律要用户确认
+    if tool_name.startswith("mcp__"):
+        if mcp_policy_for(tool_name) == "allow":
+            return True
+        reason = f"External MCP tool {tool_name} is not allowlisted"
+        if not interactive_allowed():
+            print(f"\n[!]  {reason} - auto denied (no interactive approver here)")
+            print(f"   Blocked command: {report_command(tool_name, arguments)}")
+            return False
+        if ask_user(tool_name, arguments, reason) == "deny":
+            return False
+        return True
 
     # 黄:删除 / 越界访问等 → 询问用户
     reason = check_rules(tool_name, arguments)

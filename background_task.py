@@ -4,6 +4,26 @@ import subprocess
 import threading
 
 
+def kill_process_tree(process):
+    """Windows:连同命令自己拉起的子进程一起杀掉,避免留下孤儿。
+
+    放在本模块而不是 tool_handlers,是为了保持 import 单向:
+    tool_handlers 依赖 background_task,反过来导入会成环。
+    """
+    if process.poll() is not None:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            capture_output=True, text=True, timeout=15,
+            # taskkill 在中文 Windows 上输出 GBK;这里必须显式给 encoding +
+            # errors="replace",否则 UTF-8 模式下解码会抛 UnicodeDecodeError
+            encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        process.kill()
+
+
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
     """判断这次工具调用是否要放到后台执行。"""
     return tool_name == "bash" and tool_input.get("run_in_background") is True
@@ -15,12 +35,17 @@ def _format_bash_result(command, stdout, stderr, returncode):
 
 
 def _run_bash_process(command):
-    """同步跑完命令,返回 (stdout, stderr, returncode)。"""
-    result = subprocess.run(
-        command, shell=True, capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
+    """同步跑完命令,返回 (stdout, stderr, returncode, process)。
+
+    用 Popen 而不是 run,是为了把进程句柄交出去做进程树清理。
+    注意:后台任务故意不设 timeout —— 跑得久正是它存在的理由。
+    """
+    process = subprocess.Popen(
+        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
     )
-    return result.stdout, result.stderr, result.returncode
+    stdout, stderr = process.communicate()
+    return stdout, stderr, process.returncode, process
 
 
 class BackgroundManager:
@@ -48,9 +73,10 @@ class BackgroundManager:
 
     def _run(self, task_id: str, command: str):
         """在子线程里执行命令,结束后登记状态和结果。"""
-        # 后台任务故意不设 timeout:跑得久正是它存在的理由
+        # 后台任务故意不设 timeout: 跑得久正是它存在的理由
         try:
-            stdout, stderr, returncode = _run_bash_process(command)
+            stdout, stderr, returncode, process = _run_bash_process(command)
+            kill_process_tree(process)
             status = "completed" if returncode == 0 else "failed"
             result = _format_bash_result(command, stdout, stderr, returncode)
         except Exception as error:
@@ -96,6 +122,16 @@ class BackgroundManager:
                 for task in self.tasks.values()
                 if task["status"] == "running"
             ]
+
+    def has_ready(self) -> bool:
+        """有没有已完成但未取走的后台任务(不消费)。"""
+        with self._lock:
+            return bool(self._ready)
+
+    def has_running(self) -> bool:
+        """还有没有在跑的后台任务。"""
+        with self._lock:
+            return any(t["status"] == "running" for t in self.tasks.values())
 
 
 BACKGROUND = BackgroundManager()

@@ -3,7 +3,8 @@ import time
 import queue
 
 from agent import agent_loop
-from cron_scheduler import has_due_jobs, start_scheduler
+from background_task import BACKGROUND
+from cron_scheduler import consume_cron_queue, has_due_jobs, save_durable_jobs, start_scheduler
 from hooks import register_default_hooks, trigger_hooks
 from memory import MEMORY_MANAGER
 from permissions import set_interactive_allowed
@@ -34,16 +35,29 @@ def stdin_reader():
 
 
 def wait_for_cli_event():
-    """等用户输入或 Lead 收件箱,返回 (kind, payload)。"""
+    """等用户输入 / 队友消息 / 后台任务完成 / 定时任务。"""
     while True:
+        # 1. 队友消息，优先级最高
         if BUS.peek("lead"):
             return "wake", None
+
+        # 2. 后台任务完成
+        if BACKGROUND.has_ready():
+            return "background", None
+
+        # 3. Cron 到期
+        if has_due_jobs():
+            return "cron", None
+
+        # 4. 用户输入
         try:
             line = _input_queue.get(timeout=0.25)
         except queue.Empty:
             continue
+
         if line is None:
             return "quit", None
+
         return "user", line
 
 
@@ -84,23 +98,32 @@ def run_query(query):
     agent_loop(messages, parent_todo, query, relevant_memories)
 
 
-def scheduled_worker():
-    """队列处理线程:空闲时把到期任务交给 Agent Loop。"""
-    while True:
-        time.sleep(1)
-        if not has_due_jobs():
-            continue
-        with TURN_LOCK:
-            # 用户回合可能刚把任务取走,锁内再确认一次
-            if not has_due_jobs():
-                continue
-            # 定时回合拒绝交互确认,不会与主终端同时读输入
-            set_interactive_allowed(False)
-            try:
-                print("\n[Cron] scheduled turn start")
-                run_query(SCHEDULED_REQUEST)
-            finally:
-                set_interactive_allowed(True)
+def run_cron_turn(messages, todo, active_request, memories):
+    """在主线程里把到期任务注入同一个会话,然后跑一轮。"""
+    jobs = consume_cron_queue()
+    if not jobs:
+        return
+    for job in jobs:
+        messages.append({
+            "role": "user",
+            "content": f"[Scheduled] {job.prompt}",
+        })
+        print(f"\n[Cron] injected: {job.prompt[:60]}")
+    if any(job.durable and not job.recurring for job in jobs):
+        # 一次性 durable 任务已从内存删除,交付之后再写回
+        save_durable_jobs()
+    # 定时回合不应该弹交互确认
+    set_interactive_allowed(False)
+    try:
+        agent_loop(
+            messages,
+            todo,
+            active_request,
+            memories,
+            True,
+        )
+    finally:
+        set_interactive_allowed(True)
 
 
 if __name__ == "__main__":
@@ -108,7 +131,6 @@ if __name__ == "__main__":
     register_default_hooks()
     # 调度线程和队列处理线程只在运行 CLI 时启动
     start_scheduler()
-    threading.Thread(target=scheduled_worker, daemon=True).start()
     # stdin 从后台线程读,主线程才腾得出来等收件箱
     threading.Thread(target=stdin_reader, daemon=True).start()
 
@@ -121,27 +143,25 @@ if __name__ == "__main__":
         kind, payload = wait_for_cli_event()
         if kind == "quit":
             break
-        if kind == "user":
+        elif kind == "user":
             if not payload.strip():
                 continue
             if payload.strip().lower() in ("exit", "quit"):
                 break
             if session_messages is None:
-                # 第一条输入:建会话级上下文
                 session_messages, session_todo, session_memories = (
                     start_session(payload)
                 )
                 session_request = payload
             else:
-                # 后续输入:追加到同一个会话
                 trigger_hooks("UserPromptSubmit", payload)
                 session_messages.append({
                     "role": "user",
                     "content": clean_text(payload),
                 })
             is_team_turn = False
-        else:
-            # 队友事件唤醒:先更新协议状态,再注入
+
+        elif kind == "wake":
             inbox = consume_lead_inbox()
             if not inbox:
                 continue
@@ -154,6 +174,33 @@ if __name__ == "__main__":
             print(f"[wake: {len(inbox)} team event(s) -> new turn]")
             is_team_turn = True
 
+        elif kind == "background":
+            if session_messages is None:
+                continue
+            print("[wake: background task finished -> new turn]")
+            with TURN_LOCK:
+                agent_loop(
+                    session_messages,
+                    session_todo,
+                    session_request,
+                    session_memories,
+                    True,
+                )
+            continue
+
+        elif kind == "cron":
+            if session_messages is None:
+                continue
+            print("[cron: due job -> same session]")
+            with TURN_LOCK:
+                run_cron_turn(
+                    session_messages,
+                    session_todo,
+                    session_request,
+                    session_memories,
+                )
+            continue
+
         with TURN_LOCK:
             agent_loop(
                 session_messages,
@@ -162,4 +209,5 @@ if __name__ == "__main__":
                 session_memories,
                 is_team_turn,
             )
+
         print()
