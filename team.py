@@ -9,8 +9,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from config import BASE_DIR, MODEL, WORKDIR, client
+from config import BASE_DIR, DEFAULT_MAX_TOKENS, WORKDIR
 from hooks import trigger_hooks
+from model_client import RecoveryState, stream_call_model
 from permissions import delete_sandbox, set_interactive_allowed
 from prompts import SHELL_RULES
 from taskboard import TASKS, task_store_lock
@@ -383,7 +384,11 @@ def scan_unclaimed_tasks():
 
 
 def team_claim_task(task_id, owner):
-    """在锁内认领任务并绑定 owner 的工作目录。"""
+    """认领 teammate 任务并绑定它的工作目录。
+
+    任务状态本身由 tool_handlers.claim_task 统一完成;这里不再复制
+    pending/依赖/status 的认领逻辑,只处理 teammate 的额外 assignment 约束。
+    """
     with task_store_lock():
         if teammate_assignments.get(owner):
             return (
@@ -398,6 +403,8 @@ def team_claim_task(task_id, owner):
         cwd, error = task_worktree_cwd(task)
         if error:
             return f"Cannot claim {task_id}: {error}"
+        # 统一走任务板认领核心。task_store_lock 使用 RLock,因此这里的
+        # 嵌套调用不会死锁,同时 assignment 绑定仍与认领处于同一临界区。
         result = claim_task(task_id, owner)
         if not result.startswith("Claimed "):
             return result
@@ -549,6 +556,8 @@ class TeammateRuntime:
         """拼好系统提示词、首批消息和工具表。"""
         self.name = name
         self.turns_this_task = 0
+        # 队友跨轮复用一份恢复状态:连续 529 的计数要跨轮累加才看得出"一直过载"
+        self.recovery = RecoveryState()
         self.system = (
             f"You are '{name}', a {role}. Use tools to complete the assigned "
             "Task, then call complete_task and report a concise result. "
@@ -683,11 +692,12 @@ class TeammateRuntime:
         with team_lock:
             active_teammates[self.name] = "working"
         try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=self.messages,
-                tools=TEAMMATE_TOOLS,
-                tool_choice="auto",
+            # 走唯一出口:队友因此也拿到 429/529 退避,烧掉的 token 也进会话账。
+            # 改造前这里是直连 client.chat.completions.create,既不退避也不计量。
+            # on_text 传 None:多个队友的正文打到同一个终端会互相插花,
+            # 队友的产出本来就通过消息总线交给 lead
+            response = stream_call_model(
+                self.messages, TEAMMATE_TOOLS, self.recovery, DEFAULT_MAX_TOKENS,
             )
         except Exception as error:
             BUS.send(self.name, "lead",
@@ -841,7 +851,6 @@ def spawn_teammate_thread(name, role, prompt, task_id=None, require_plan=False):
         active_teammates[name] = "working"
         plan_gates[name] = "required" if require_plan else "not_required"
         assignment_versions[name] = 0
-
     if task_id:
         claimed = team_claim_task(task_id, name)
         if not claimed.startswith("Claimed "):

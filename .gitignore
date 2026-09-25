@@ -7,12 +7,16 @@ __pycache__/
 *.py[cod]
 
 # Agent 运行时产生的状态(会随每次会话变化)
+.sessions/
 .tasks/
 .mailboxes/
 .worktrees/
 .transcripts/
 .task_outputs/
 .scheduled_tasks.json
+
+# 测试
+.pytest_cache/
 
 # 本机专属设置
 .claude/settings.local.json
@@ -22,3 +26,5 @@ __pycache__/
 # 编辑器
 .vscode/
 .idea/
+
+.workflows/

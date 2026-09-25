@@ -25,7 +25,30 @@ API_KEY = os.getenv("DEEPSEEK_API_KEY")
 BASE_URL = os.getenv("DEEPSEEK_BASE_URL")
 MODEL = os.getenv("MODEL_ID")
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+class LazyClient:
+    """惰性 OpenAI 客户端:首次真正调用时才读 .env 建连接。
+
+    原来这里在 import 阶段就 `OpenAI(...)`,于是只测纯函数的单测也被迫依赖
+    .env 存在(没配 key 时构造就抛错)。改成惰性之后,单测不碰客户端就完全不
+    需要密钥,将来上 CI 也不用先注入假 key。
+    """
+
+    def __init__(self):
+        """只记状态,不建连接。"""
+        self._client = None
+
+    def _connect(self):
+        """首次访问时创建真正的客户端。"""
+        if self._client is None:
+            self._client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        return self._client
+
+    def __getattr__(self, name):
+        """把属性访问转发给真正的客户端,调用方写法完全不变。"""
+        return getattr(self._connect(), name)
+
+
+client = LazyClient()
 
 # 尚无计划时,连续多少次"非-todo 工具调用"后提醒模型先建计划
 REMINDER_EVERY = 3
@@ -59,3 +82,10 @@ ESCALATED_MAX_TOKENS = 16000
 # 升级之后仍然顶到上限,最多再要求模型"继续写"几次;
 # 没有这个上限就会无限 continue(模型每次都在写长输出时死循环)
 MAX_RECOVERY_RETRIES = 3
+
+# 主循环刹车:非交互回合(定时 / 队友 / 后台唤醒)的兜底上限。
+# 主循环是全部循环里唯一没有上限的那个,而它偏偏最可能长时间跑。
+# 刻意**不**约束用户手动提问的回合 —— 那种场合的正解是"能被干净取消",
+# 不是"到点自尽",跑到第 60 轮被砍掉是另一种难受。
+MAX_TURNS = 60
+MAX_SECONDS = 1800

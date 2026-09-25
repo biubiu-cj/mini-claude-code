@@ -1,6 +1,8 @@
 from config import WORKDIR
+from goal import goal_stop_hook
+from model_client import USAGE
 from permissions import check_permission
-from util import log_tag
+from util import in_subagent, log_tag
 
 
 #HOOK表
@@ -58,9 +60,13 @@ def large_output_hook(tool_call, arguments, output):
 
 #统计对话过程中用了多少次工具
 def summary_hook(messages: list) -> None:
-    """Agent loop 即将停下时,打印本次会话的工具调用次数。"""
+    """Agent loop 即将停下时,打印本次会话的工具调用次数与 token 消耗。"""
     tool_count = sum(1 for message in messages if message.get("role") == "tool")
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    # 子 agent 的循环收尾时也会触发 Stop,但账是会话级的(含子 agent),
+    # 在子会话里重复报一次只会刷屏
+    if not in_subagent():
+        print(f"\033[90m[HOOK] Stop: {USAGE.summary()}\033[0m")
     return None  # return None = no modification, let stop through
 
 _defaults_registered = False
@@ -75,5 +81,7 @@ def register_default_hooks():
     register_hooks("PreToolUse", permission_hook)
     register_hooks("PreToolUse", log_hook)
     register_hooks("PostToolUse", large_output_hook)
+    # Goal 判断排在前面:它拦下这一轮时,就不必再打"本次会话用了多少次工具"了
+    register_hooks("Stop", goal_stop_hook)
     register_hooks("Stop", summary_hook)
     _defaults_registered = True

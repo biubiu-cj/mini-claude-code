@@ -1,28 +1,28 @@
-from dataclasses import dataclass
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from background_task import BACKGROUND, should_run_background
 from compaction import COMPACTOR
 from config import (
     DEFAULT_MAX_TOKENS,
     ESCALATED_MAX_TOKENS,
-    FALLBACK_MODEL,
     MAIN_OWNER,
-    MAX_CONSECUTIVE_529,
     MAX_RECOVERY_RETRIES,
-    MAX_RETRIES,
-    MODEL,
+    MAX_SECONDS,
+    MAX_TURNS,
     PLAN_CHECK_EVERY,
     REMINDER_EVERY,
-    client,
 )
+from model_client import RecoveryState, stream_call_model
 from cron_scheduler import consume_cron_queue, list_crons, save_durable_jobs
 from hooks import trigger_hooks
 from mcp_client import assemble_tool_pool, run_connect_mcp
 from memory import MEMORY_MANAGER
+from permissions import interactive_allowed, set_interactive_allowed
 from prompts import build_sub_system_prompt, build_system_prompt
+from taskboard import release_owner_tasks
 from team import run_create_worktree, run_list_teammates, run_request_plan, run_request_shutdown, run_review_plan, run_send_message, run_spawn_teammate
 from todo import TodoManager
 from tool_handlers import (
@@ -44,7 +44,8 @@ from tool_handlers import (
     update_task,
 )
 from toolschema import SUB_TOOLS
-from util import clean_text, parse_json
+from util import agent_label, clean_text, mark_subagent, parse_json, set_agent_label
+from workflow import run_workflow_sync
 
 
 # 算作"规划活动"的工具:调用它们就认为模型在维护计划,不该再催它去建计划。
@@ -109,61 +110,39 @@ def refresh_system_prompt(messages, build, relevant_memories, todo_text):
         system["content"] = build(relevant_memories, todo_text)
 
 
-@dataclass
-class RecoveryState:
-    """一次 agent 轮次内的恢复状态:max_tokens 升级、529 计数、继续写次数。"""
-    has_escalated: bool = False
-    consecutive_529: int = 0
-    recovery_count: int = 0
+class StreamPrinter:
+    """流式正文的渲染器:逐段打印,整段结束后补一次换行。
 
+    补换行是必要的:模型正文后面紧跟着工具调用的日志行,不补的话
+    `[HOOK] bash(...)` 会接在正文最后一个字后面。
+    """
 
-def retry_delay(attempt):
-    """指数退避的等待秒数。"""
-    return min(2 ** attempt, 30)
+    def __init__(self):
+        """还没有输出过任何文本。"""
+        self.wrote = False
 
+    def __call__(self, text):
+        """打印一段正文 delta;flush 不能省,否则会被缓冲到整段结束,等于没做流式。"""
+        self.wrote = True
+        print(text, end="", flush=True)
 
-def call_model(messages, tools, state, max_tokens):
-    """带恢复的模型调用:429/529 退避重试,必要时切备用模型。"""
-    model = MODEL
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = client.chat.completions.create(
-                model=model, messages=messages, tools=tools,
-                tool_choice="auto", max_tokens=max_tokens,
-            )
-            state.consecutive_529 = 0
-            return response
-        except Exception as error:
-            text = str(error).lower()
-            if "429" in text or "rate limit" in text or "ratelimit" in text:
-                kind = "429"
-            elif "529" in text or "overloaded" in text:
-                kind = "529"
-                state.consecutive_529 += 1
-                if state.consecutive_529 >= MAX_CONSECUTIVE_529 and FALLBACK_MODEL:
-                    model = FALLBACK_MODEL
-                    state.consecutive_529 = 0
-                    print(f"\n[529] switching to {FALLBACK_MODEL}")
-            else:
-                raise
-            # 重试耗尽就抛出**原始**错误:套一层笼统的 RuntimeError 会把
-            # 429 / 529 的区分盖掉,日志里就看不出真实原因
-            if attempt == MAX_RETRIES - 1:
-                raise
-            delay = retry_delay(attempt)
-            print(f"\n[{kind}] retry {attempt + 1}/{MAX_RETRIES} in {delay:.0f}s")
-            time.sleep(delay)
-    # 只有 MAX_RETRIES <= 0 才会走到这里
-    raise RuntimeError(f"model call failed after {MAX_RETRIES} attempts")
-
-
+    def finish(self):
+        """整段结束:写过内容就补一个换行。"""
+        if self.wrote:
+            print()
+            self.wrote = False
 
 
 
 #agent loop
 def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
-               is_team_turn=False):
-    """主 Agent 循环:一路跑到模型不再调用工具为止。"""
+               is_team_turn=False, stream_fn=stream_call_model):
+    """主 Agent 循环:一路跑到模型不再调用工具为止。
+
+    `stream_fn` 是模型调用的注入点:生产环境用唯一出口 stream_call_model,
+    测试时传一个脚本化的假实现,就能不联网跑通工具分片、坏 JSON、
+    max_tokens 升级这些真正容易出错的路径。
+    """
     tool_calls_since_todo = 0  # 连续未更新 todo 的工具调用数
     board_used = False         # 本会话是否动过持久任务板
     pending_checkin = False  # 刚注入自检提醒:下一轮纯文本是应答,不是任务完成
@@ -171,12 +150,35 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
     reactive_retries = 0 #补救次数
     state = RecoveryState() #恢复状态
     max_tokens = DEFAULT_MAX_TOKENS
+    deadline = time.time() + MAX_SECONDS
+    turns = 0
     while True:
+        # 刹车:只对**非交互回合**启用。定时回合、队友回合、后台唤醒这些
+        # 没人在终端盯着,跑飞了必须能自己收手;而用户手动提问的回合不受约束,
+        # 上限用 is_team_turn 这个现成的标记来区分(main 对它传 True)。
+        #
+        # 这里的轮数/超时是**兜底保险**,不是刹车的本体 ——
+        # 交互回合的正解是可被干净取消,而不是到点自尽。
+        if is_team_turn:
+            turns += 1
+            if turns > MAX_TURNS:
+                print(f"\n[brake] stopped after {MAX_TURNS} turns "
+                      "(non-interactive turn)")
+                return
+            if time.time() > deadline:
+                print(f"\n[brake] stopped after {MAX_SECONDS}s "
+                      "(non-interactive turn)")
+                return
         # 每轮先把当前计划刷进 system 消息,让它扛得住压缩
         refresh_system_prompt(
             messages, build_system_prompt, relevant_memories, todo_manager.render()
         )
-        messages = COMPACTOR.prepare(messages, active_request)
+        # 必须切片赋值就地替换,不能 `messages = ...`:prepare 里的 snip_compact
+        # 和 compact_history 会返回一个**新列表**,一旦重新绑定局部名字,
+        # 调用方(main 的会话、以及会话持久化)手里那份引用就永远停在压缩前的
+        # 旧内容上,之后每一轮新增的消息都写进了这个新列表 ——
+        # 表现为长会话里 agent 突然"失忆",而落盘的会话还缺了后半段
+        messages[:] = COMPACTOR.prepare(messages, active_request)
         # 压缩之后再注入:通知作为最新消息,不会被本轮的压缩吞掉
         inject_background_results(messages)
         inject_cron_jobs(messages)
@@ -191,8 +193,12 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
                 "content": f"[MCP tool pool error] {error}",
             })
             return
+        printer = StreamPrinter()
         try:
-            response = call_model(messages, tools, state, max_tokens)
+            response = stream_fn(
+                messages, tools, state, max_tokens, on_text=printer
+            )
+            printer.finish()
             # 请求成功，重置上下文过长的补救次数
             reactive_retries = 0
         except Exception as error:
@@ -204,7 +210,8 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
             )
             if too_long and reactive_retries < 1:
                 print("[context too long, reactive compact]")
-                messages = COMPACTOR.reactive_compact(messages, active_request)
+                # 同上:reactive_compact 一定返回新列表,必须就地替换
+                messages[:] = COMPACTOR.reactive_compact(messages, active_request)
                 reactive_retries += 1
                 # 压缩之后重新调用模型
                 continue
@@ -256,11 +263,11 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
         messages.append(assistant_message)
 
         if not tool_calls:
+            # 注意:正文已经在 stream_fn 里边收边渲染了(StreamPrinter),
+            # 这里的所有分支都不再重复 print(message.content),否则同一段话会打两遍
             if pending_checkin:
                 # 纯文本 = 对自检提醒的应答(如"继续执行"),不是任务完成
                 pending_checkin = False
-                if message.content:
-                    print(message.content)
                 messages.append({
                     "role": "user",
                     "content": "Continue the task now: call tools directly, "
@@ -271,14 +278,10 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
             # 模型想收尾:先补投已完成的后台结果;还有在跑的提醒一次,
             # 让它自己决定是等结果还是放弃(再答纯文本就放行,不再拦)
             if inject_background_results(messages):
-                if message.content:
-                    print(message.content)
                 continue
             running = BACKGROUND.running()
             if running and not bg_stop_nudged:
                 bg_stop_nudged = True
-                if message.content:
-                    print(message.content)
                 messages.append({
                     "role": "user",
                     "content": (
@@ -292,8 +295,6 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
                     ),
                 })
                 continue
-            if message.content:
-                print(message.content)
             force = trigger_hooks("Stop", messages)   # ← 退出之前
             if force:
                 # hook returned a message → inject it and continue
@@ -360,10 +361,12 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
                     output = start_background_task(arguments["command"])
                 elif tool_name == "todo_write":
                     output = clean_text(handler(**arguments, todo_manager=todo_manager))
-                elif tool_name == "task":
-                    # 子 agent 复用父循环已召回的 memory,注入方式同 todo_manager
+                elif tool_name in {"subagent", "parallel_subagents"}:
+                    # 子 agent 复用父循环已召回的 memory,注入方式同 todo_manager;
+                    # stream_fn 一并透传,测试时注入的假模型才能覆盖到子 agent
                     output = clean_text(
-                        handler(**arguments, relevant_memories=relevant_memories)
+                        handler(**arguments, relevant_memories=relevant_memories,
+                                stream_fn=stream_fn)
                     )
                 elif tool_name in ("claim_task", "complete_task"):
                     # owner 由运行时注入:模型自己填的身份不构成任何约束
@@ -421,18 +424,96 @@ def agent_loop(messages, todo_manager, active_request, relevant_memories=(),
             messages.append({"role": "user", "content": reminder})
 
 
-def run_subagent(prompt: str, relevant_memories=()) -> str:
+def run_subagent(prompt: str, relevant_memories=(), stream_fn=stream_call_model) -> str:
     """跑一个一次性子 Agent,只有它返回的最终文本会回到父上下文。"""
+    # 子 agent 的循环里也调 trigger_hooks("Stop"),Goal 判断必须绕开它 ——
+    # 子 agent 的对话说明不了主目标是否完成。子 agent 跑在 lead 自己的线程上,
+    # 标记漏了会**永久**关掉 Goal,所以必须 try/finally
+    #
+    # child_owner 每次调用都是新的随机 id,所以子 agent 中途返回(撞 30 轮上限、
+    # 抛错、或自己放弃)时,它认领的任务再也没人能 complete。这里兜住:
+    # 没做完的退回 pending,而不是永久卡在 in_progress
+    child_owner = "sub_" + os.urandom(3).hex()
+    mark_subagent(True)
+    try:
+        return _subagent_loop(prompt, relevant_memories, child_owner, stream_fn)
+    finally:
+        mark_subagent(False)
+        try:
+            released = release_owner_tasks(child_owner)
+        except Exception as error:
+            # finally 里抛错会顶掉正在冒泡的原始异常,所以这里必须吞
+            print(f"\n[subagent] could not release {child_owner}'s tasks: {error}")
+        else:
+            if released:
+                print(f"\n[subagent] {child_owner} released "
+                      f"{', '.join(released)} back to pending")
+
+
+def _run_parallel_subagent(index, prompt, relevant_memories, stream_fn):
+    """在线程池 worker 中运行一个子 Agent,隔离标签和交互权限。"""
+    previous_label = agent_label()
+    previous_interactive = interactive_allowed()
+    set_agent_label(f"sub-{index + 1}")
+    # 多个 worker 不能安全地同时抢 stdin 做确认;危险操作在并行批处理中拒绝。
+    set_interactive_allowed(False)
+    try:
+        return run_subagent(prompt, relevant_memories, stream_fn)
+    except Exception as error:
+        return f"Error: {type(error).__name__}: {error}"
+    finally:
+        set_interactive_allowed(previous_interactive)
+        set_agent_label(previous_label)
+
+
+def run_parallel_subagents(prompts, max_workers=None, relevant_memories=(),
+                          stream_fn=stream_call_model) -> str:
+    """并行运行一批一次性 subagent,按输入顺序返回最终文本。"""
+    if not isinstance(prompts, list) or len(prompts) < 2:
+        raise ValueError("parallel_subagents requires at least 2 prompts")
+    if len(prompts) > 8:
+        raise ValueError("parallel_subagents supports at most 8 prompts")
+    if any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts):
+        raise ValueError("Every parallel subagent prompt must be a non-empty string")
+
+    if max_workers is None:
+        max_workers = len(prompts)
+    if not isinstance(max_workers, int) or not 1 <= max_workers <= 8:
+        raise ValueError("max_workers must be an integer between 1 and 8")
+    max_workers = min(max_workers, len(prompts))
+
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="parallel-subagent",
+    ) as pool:
+        futures = [
+            pool.submit(_run_parallel_subagent, index, prompt, relevant_memories,
+                        stream_fn)
+            for index, prompt in enumerate(prompts)
+        ]
+        results = [future.result() for future in futures]
+
+    return "\n\n".join(
+        f"[Parallel subagent {index + 1}]\n{result}"
+        for index, result in enumerate(results)
+    )
+
+
+def _subagent_loop(prompt: str, relevant_memories=(), child_owner: str = "",
+                   stream_fn=stream_call_model) -> str:
+    """子 agent 的循环主体:每个子会话有自己的 TodoManager 和 owner 身份。"""
     # 每个 Subagent 会话创建自己的 TodoManager,与父 Agent / 其它 Subagent 完全独立
     child_todo = TodoManager()
-    # 独立的归属身份:任务图里的 owner 就是靠它区分的,
-    # 因此子 agent 只能完成自己认领的任务,父 agent 也不能替它完成
-    child_owner = "sub_" + os.urandom(3).hex()
+    # child_owner 由 run_subagent 生成后注入:任务图里的 owner 就是靠它区分的,
+    # 因此子 agent 只能完成自己认领的任务,父 agent 也不能替它完成。
+    # 生成放在外层,是为了让 run_subagent 能在 finally 里回收它认领的任务
     messages = [
         {"role": "system", "content": build_sub_system_prompt(relevant_memories)},
         {"role": "user", "content": clean_text(prompt)},
     ]
     reactive_retries = 0 #补救次数
+    # 子会话自己的恢复状态:429/529 退避的计数是每个会话独立的
+    state = RecoveryState()
     tool_calls_since_todo = 0  # 连续未更新 todo 的工具调用数(每个子会话独立)
     pending_checkin = False  # 刚注入自检提醒:下一轮纯文本是应答,不是任务完成
     for _ in range(30):
@@ -440,11 +521,17 @@ def run_subagent(prompt: str, relevant_memories=()) -> str:
         refresh_system_prompt(
             messages, build_sub_system_prompt, relevant_memories, child_todo.render()
         )
-        messages = COMPACTOR.prepare(messages, prompt)
+        # 同父循环用切片赋值:子会话的列表不外逃,重新绑定本来也无害,
+        # 但两处写法一致才不会让人照抄错的那一种
+        messages[:] = COMPACTOR.prepare(messages, prompt)
         try:
-            response = client.chat.completions.create(
-                model=MODEL, messages=messages, tools=SUB_TOOLS, tool_choice="auto",
-            )
+            # 走同一个出口:子 agent 因此一并拿到 429/529 退避、流式拼装和
+            # token 计量。改造前这里是直连 client.chat.completions.create,
+            # 绕开了 call_model 的全部保护,连 max_tokens 都没传
+            #
+            # on_text 传 None:并行子 agent 的正文若打到同一个终端会互相插花,
+            # 而子会话的结论本来就是由父循环读工具结果来消费的
+            response = stream_fn(messages, SUB_TOOLS, state, DEFAULT_MAX_TOKENS)
             reactive_retries = 0
         except Exception as error:
             error_message = str(error).lower()
@@ -456,7 +543,7 @@ def run_subagent(prompt: str, relevant_memories=()) -> str:
 
             if (too_long and reactive_retries < 1):
                 print("[subagent context too long, reactive compact]")
-                messages = COMPACTOR.reactive_compact(messages, prompt)
+                messages[:] = COMPACTOR.reactive_compact(messages, prompt)
                 reactive_retries += 1
                 continue
             raise
@@ -576,7 +663,8 @@ TOOL_HANDLERS = {
     "edit_file": run_edit,
     "glob": run_glob,
     "todo_write": run_todo_write,
-    "task": run_subagent,
+    "subagent": run_subagent,
+    "parallel_subagents": run_parallel_subagents,
     "load_skill": run_load_skill,
 
     "create_task": create_task,
@@ -598,6 +686,8 @@ TOOL_HANDLERS = {
     "schedule_cron": run_schedule_cron,
     "list_crons": list_crons,
     "cancel_cron": run_cancel_cron,
+
+    "Workflow": run_workflow_sync,
 }
 
 # 子 agent 的白名单直接由 SUB_TOOLS 推导:工具列表和 handler 表不会各改一处而错位。
