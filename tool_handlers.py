@@ -5,7 +5,7 @@ from dataclasses import asdict
 from background_task import BACKGROUND, kill_process_tree
 from config import WORKDIR
 from skill_loader import SKILL_LOADER
-from taskboard import TASKS
+from taskboard import TASKS, task_store_lock
 from util import log_tag
 from cron_scheduler import (
     cancel_cron,
@@ -44,7 +44,9 @@ def run_bash(command, cwd=None):
         output = stdout
         if stderr:
             output += stderr
-        return output
+        # 退出码必须写进结果:Goal 的判断器没有工具,只能读对话,
+        # 「退出码为 0」这类完成条件靠这一行才有据可查
+        return f"exit_code={process.returncode}\n{output}"
     except subprocess.TimeoutExpired:
         kill_process_tree(process)
         return "Command timed out after 30 seconds."
@@ -156,55 +158,66 @@ def get_task(task_id: str) -> str:
 
 #任务认领
 def claim_task(task_id: str, owner: str) -> str:
-    """把一条 pending 任务认领给自己;前置未完成则拒绝。"""
-    tasks_by_id = TASKS.load_all()
-    task = TASKS.load(task_id)
-    if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
-    dependencies = TASKS.incomplete_dependencies(task, tasks_by_id)
-    if dependencies:
-        return f"Blocked by: {', '.join(dependencies)}"
-    task.owner = owner
-    task.status = "in_progress"
-    TASKS.save(task)
-    return f"Claimed {task_id} ({task.subject})"
+    """原子地认领一条 pending 任务;前置未完成则拒绝。
+
+    这是所有 Agent 共用的任务状态转换入口。team.py 的
+    ``team_claim_task`` 只负责 teammate 专属的 assignment/worktree 约束,
+    最终仍通过这里完成 pending -> in_progress 的状态更新。
+    """
+    # 读、检查、改、写必须在同一把锁里完成。否则两个线程都可能先读到
+    # pending,然后都返回 Claimed,最后一个写入者覆盖前一个 owner。
+    with task_store_lock():
+        tasks_by_id = TASKS.load_all()
+        task = TASKS.load(task_id)
+        if task.status != "pending":
+            return f"Task {task_id} is {task.status}, cannot claim"
+        dependencies = TASKS.incomplete_dependencies(task, tasks_by_id)
+        if dependencies:
+            return f"Blocked by: {', '.join(dependencies)}"
+        task.owner = owner
+        task.status = "in_progress"
+        TASKS.save(task)
+        return f"Claimed {task_id} ({task.subject})"
 
 
 #完成任务
 def complete_task(task_id: str, owner: str) -> str:
-    """完成自己认领的任务,并报告因此解除阻塞的任务。"""
-    # 一次读盘拿到全部任务,避免下面反复 list()/can_start() 造成的重复 IO
-    tasks_by_id = TASKS.load_all()
-    task = TASKS.load(task_id)
-    if task.status != "in_progress":
-        return f"Task {task_id} is {task.status}, cannot complete"
-    if task.owner != owner:
-        return f"Task {task_id} is owned by {task.owner}, not {owner}"
+    """原子地完成自己认领的任务,并报告因此解除阻塞的任务。"""
+    # 完成任务也是读-判断-改-写事务。否则两个并发调用可能都基于旧的
+    # 任务快照计算 ready/unblocked,或者和 teammate 退出时的释放操作交错。
+    with task_store_lock():
+        # 一次读盘拿到全部任务,避免下面反复 list()/can_start() 造成的重复 IO
+        tasks_by_id = TASKS.load_all()
+        task = TASKS.load(task_id)
+        if task.status != "in_progress":
+            return f"Task {task_id} is {task.status}, cannot complete"
+        if task.owner != owner:
+            return f"Task {task_id} is owned by {task.owner}, not {owner}"
 
-    def ready_ids():
-        """当前所有"有前置且前置都已完成"的任务 id。"""
-        return {
-            task_item.id
+        def ready_ids():
+            """当前所有"有前置且前置都已完成"的任务 id。"""
+            return {
+                task_item.id
+                for task_item in tasks_by_id.values()
+                if task_item.status == "pending" and task_item.blocked_by
+                and not TASKS.incomplete_dependencies(task_item, tasks_by_id)
+            }
+
+        ready_before = ready_ids()
+        task.status = "completed"
+        tasks_by_id[task.id] = task
+        TASKS.save(task)
+        unblocked = [
+            task_item.subject
             for task_item in tasks_by_id.values()
             if task_item.status == "pending" and task_item.blocked_by
+            and task_item.id not in ready_before
             and not TASKS.incomplete_dependencies(task_item, tasks_by_id)
-        }
-
-    ready_before = ready_ids()
-    task.status = "completed"
-    tasks_by_id[task.id] = task
-    TASKS.save(task)
-    unblocked = [
-        task_item.subject
-        for task_item in tasks_by_id.values()
-        if task_item.status == "pending" and task_item.blocked_by
-        and task_item.id not in ready_before
-        and not TASKS.incomplete_dependencies(task_item, tasks_by_id)
-    ]
-    message = f"Completed {task_id} ({task.subject})"
-    if unblocked:
-        message += "\nUnblocked: " + ", ".join(unblocked)
-    return message
+        ]
+        message = f"Completed {task_id} ({task.subject})"
+        if unblocked:
+            message += "\nUnblocked: " + ", ".join(unblocked)
+        return message
 
 
 def run_schedule_cron(cron, prompt, recurring=True, durable=False):

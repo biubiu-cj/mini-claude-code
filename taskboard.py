@@ -222,3 +222,35 @@ def task_store_lock():
     """序列化任务存储的读-改-写,防止并发认领同一个任务。"""
     with _store_lock:
         yield
+
+
+def _reset_to_pending(task):
+    """把一条任务退回未认领状态并落盘。"""
+    task.status = "pending"
+    task.owner = None
+    TASKS.save(task)
+
+
+def release_owner_tasks(owner) -> list[str]:
+    """把某个 owner 名下未完成的任务退回 pending,返回被退回的任务 id。"""
+    released = []
+    with task_store_lock():
+        for task in TASKS.list():
+            if task.status == "in_progress" and task.owner == owner:
+                _reset_to_pending(task)
+                released.append(task.id)
+    return released
+
+
+# 进程崩溃/被杀时,持有任务的队友线程和子 agent 都没机会回收。它们的 owner
+# 指向一个已经不存在的线程,而 claim 要求 status == "pending",所以不退回的话
+# 这些任务会永远卡死:没人能认领,原 owner 也永远不会再出现。
+def reap_orphaned_tasks() -> list[str]:
+    """启动时回收孤儿任务:把所有 in_progress 退回 pending,返回其 id。"""
+    released = []
+    with task_store_lock():
+        for task in TASKS.list():
+            if task.status == "in_progress":
+                _reset_to_pending(task)
+                released.append(task.id)
+    return released

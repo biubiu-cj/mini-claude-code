@@ -124,9 +124,11 @@ BASE_TOOLS = [
         "function": {
             "name": "todo_write",
             "description": (
-                "Create or update the task plan. "
-                "Use this for complex tasks and update "
-                "the status as work progresses."
+                "Create or update the current agent's short-term plan. "
+                "This is an in-memory checklist only: it does not create "
+                "persistent task-board tasks, assign work, or start a teammate. "
+                "Use create_task explicitly when work must be delegated, "
+                "parallelized, dependency-managed, or survive the session."
             ),
             "parameters": {
                 "type": "object",
@@ -189,16 +191,16 @@ BASE_TOOLS = [
 
 
 #父系统调用子系统的工具
-TASK_TOOL = {
+SUBAGENT_TOOL = {
     "type": "function",
     "function": {
-        "name": "task",
+        "name": "subagent",
         "description": (
-            "Delegate one self-contained piece of work to a subagent that runs with "
-            "a fresh, empty context and returns only its final text. Use it when the "
-            "intermediate output would flood your context and you only need the "
-            "conclusion. The subagent cannot see this conversation, but it shares "
-            "the persistent task board with you."
+            "Synchronously delegate one self-contained piece of work to a one-shot "
+            "subagent with a fresh, empty context and wait for its final text. Use "
+            "it when you only need the conclusion or implementation result. It is "
+            "not a persistent background teammate; it cannot see this conversation, "
+            "but it shares the persistent task board with you."
         ),
         "parameters": {
             "type": "object",
@@ -213,6 +215,40 @@ TASK_TOOL = {
             "required": ["prompt"]
         }
     }
+}
+
+PARALLEL_SUBAGENTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "parallel_subagents",
+        "description": (
+            "Run 2-8 independent one-shot subagents concurrently and return "
+            "their final texts in input order. Use this for independent research "
+            "or analysis that can run in parallel. The Lead waits for this batch "
+            "to finish; this is not a persistent background teammate. Do not use "
+            "it when subagents need to edit the same files or depend on each "
+            "other's intermediate results."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompts": {
+                    "type": "array",
+                    "description": "Independent, self-contained subagent briefs.",
+                    "minItems": 2,
+                    "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "max_workers": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "description": "Maximum number of subagents running at once.",
+                },
+            },
+            "required": ["prompts"],
+        },
+    },
 }
 
 TASK_SYSTEM_TOOLS = [
@@ -335,9 +371,11 @@ TEAM_TOOLS = [
         "function": {
             "name": "spawn_teammate",
             "description": (
-                "Spawn a persistent teammate that runs its own agent loop in a "
-                "separate thread. It keeps its context across tasks, can be "
-                "messaged, and reports results back to you automatically. "
+                "Start a persistent teammate in a background thread. It runs its "
+                "own agent loop without blocking the Lead, keeps context across "
+                "tasks, can be messaged, claims ready tasks, and reports events "
+                "back asynchronously. Use it for parallelizable or continuing "
+                "work, not for an ordinary step the Lead can finish directly. "
                 "Propose the team to the user and wait for confirmation first."
             ),
             "parameters": {
@@ -570,5 +608,28 @@ COMPACT_TOOL = {
     },
 }
 
-TOOLS = [*BASE_TOOLS, *TASK_SYSTEM_TOOLS, TASK_TOOL, *TEAM_TOOLS,
-         CONNECT_TOOL, *CRON_TOOLS, COMPACT_TOOL]
+
+WORKFLOW_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "Workflow",
+        "description": (
+            "Run a saved workflow by name. Pass the workflow's input in args. "
+            "Workflows orchestrate several subagents; use resume_from_run_id to "
+            "continue a previous run without redoing finished steps."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "args": {"type": "object"},
+                "resume_from_run_id": {"type": "string"},
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+TOOLS = [*BASE_TOOLS, *TASK_SYSTEM_TOOLS, SUBAGENT_TOOL,
+         PARALLEL_SUBAGENTS_TOOL, *TEAM_TOOLS,
+         CONNECT_TOOL, *CRON_TOOLS, COMPACT_TOOL, WORKFLOW_TOOL]

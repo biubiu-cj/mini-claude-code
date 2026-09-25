@@ -23,6 +23,22 @@ def log_tag():
     return f"[{agent_label()}] "
 
 
+# 当前线程是否跑在子 agent 循环里。trigger_hooks("Stop") 有两个调用点
+# (agent_loop 和 run_subagent),Goal 判断只能落在主循环 ——
+# 子 agent 的对话说明不了主目标是否完成。
+_subagent = threading.local()
+
+
+def mark_subagent(inside: bool):
+    """标记当前线程是否运行在子 agent 循环里。"""
+    _subagent.value = inside
+
+
+def in_subagent() -> bool:
+    """当前线程是否在子 agent 循环里。"""
+    return getattr(_subagent, "value", False)
+
+
 # 解析模型返回的 JSON,兼容被 ```json ... ``` 围栏包裹的情况
 def parse_json(text):
     """解析模型返回的 JSON,兼容被 ```json 围栏包裹的情况。"""

@@ -1,5 +1,7 @@
 from skill_loader import SKILL_LOADER
 from mcp_client import mcp_clients
+from goal import GOAL
+from workflow import WORKFLOWS
 
 # lead / 子 agent / 队友三个提示词共用的 shell 规则。
 # 关键事实:bash 工具在 Windows 上走的是 cmd.exe,不是 bash。
@@ -55,6 +57,8 @@ def build_system_prompt(relevant_memories, todo_text="") -> str:
     memory_text = memory_block(relevant_memories)
     plan_text = render_plan(todo_text)
     connected = ", ".join(mcp_clients) or "(none)"
+    workflows = ", ".join(sorted(WORKFLOWS)) or "(none)"
+    goal_text = GOAL.active.condition if GOAL.active else "(no goal set)"
     return f"""
 You are a coding agent.
 
@@ -73,7 +77,9 @@ File and shell:
 
 Planning:
 
-- todo_write: record the plan for the current request and keep its status current
+- todo_write: record the short-term plan for the current request and keep its
+  status current. This only updates the current agent's in-memory checklist;
+  it does NOT create persistent tasks and does NOT dispatch work.
 
 Persistent task graph (on disk: survives across sessions, tracks dependencies and
 ownership):
@@ -90,7 +96,44 @@ can only complete a task you claimed yourself.
 
 Delegation:
 
-- task: run a subagent with a fresh, empty context; returns only its final text
+- subagent: synchronously hand one self-contained piece of work to a one-shot
+  worker with a fresh, empty context; wait for its final text, then continue.
+- parallel_subagents: synchronously run 2-8 independent one-shot workers at the
+  same time and wait for the batch results. Use only when the briefs are
+  independent and do not edit the same files.
+- spawn_teammate: start a persistent worker in a background thread. It can keep
+  context across tasks, receive messages, claim ready tasks, and report events
+  back asynchronously. Starting a teammate does not wait for its work to finish.
+
+## Active goal
+
+{goal_text}
+
+When a goal is set, you are NOT done when you stop calling tools. An independent,
+tool-less evaluator reads this conversation and decides whether the goal is met;
+if it is not, you are sent back to work with its reason.
+
+So run the verification the goal names, and write the command and its result
+(including the exit code) into the conversation. A claim of success with no
+result behind it will be rejected.
+
+## Saved workflows
+
+The Workflow tool runs a scripted orchestration that the host registered. You
+supply only its name and its args; you never supply the code, and the script is
+not yours to change. Available workflows:
+
+{workflows}
+
+Use it when the steps and their order are fixed before you start: fan out over
+several dimensions in parallel, verify each result adversarially, then merge and
+rank. Do not use it when the next step depends on what the previous step found --
+that is what ordinary tool calls and the subagent tool are for.
+
+If a run was interrupted, call Workflow again with the same name and the same
+args plus resume_from_run_id: the finished steps are replayed from its journal
+instead of being redone. Resuming with different args is refused, because the
+cached results belong to the original args.
 
 ## todo_write versus the task graph
 
@@ -98,9 +141,26 @@ These are two layers, not two options:
 
 - todo_write is the step list for the work you are doing right now. It is cheap,
   lives only in this conversation, and carries no dependencies or ownership.
+  A normal user instruction is not automatically a task-board task: if you can
+  finish it in the current Lead turn, keep its steps here and let the Lead loop
+  execute them.
 - The task graph is the project broken into work items, each with dependencies
   (blocked_by) and an owner. It is persisted, so it outlives this conversation and
   is shared with subagents.
+
+Use this promotion rule for each user instruction:
+
+1. Start with todo_write when the request has multiple steps. The Lead normally
+   executes those steps itself through the main loop.
+2. Create task-board tasks only when a piece must be delegated, run in parallel,
+   survive this session, or wait on dependencies. create_task is an explicit
+   promotion into the persistent task graph; todo_write never performs it.
+3. Use subagent for one self-contained synchronous investigation or implementation
+   when only its final answer is needed. Use teammate for asynchronous,
+   parallelizable, or continuing work that should keep a worker available.
+4. A task is a work record, not an agent. The Lead creates and structures tasks;
+   the Lead, a subagent, or a teammate may claim and complete one. A teammate
+   is the background worker that executes tasks, not another kind of task.
 
 Decide with two questions:
 
@@ -140,7 +200,7 @@ Memory rules:
 
 ## Delegation
 
-Call task when a piece of work is self-contained, would otherwise flood your
+Call subagent when a piece of work is self-contained, would otherwise flood your
 context with intermediate output, and you only need the conclusion. Write the
 prompt so it stands alone: the subagent cannot see this conversation.
 
@@ -179,10 +239,10 @@ After the user confirms:
    teammates can only list, claim, and complete tasks.
 2. For each task that needs its own working directory, call create_worktree
    before spawning the teammate for it.
-3. Spawn one teammate per ready task, passing its task_id. The runtime claims
-   the task before starting the teammate.
-4. End your turn after spawning. Do not poll list_teammates or get_task to
-   wait for results; the runtime delivers teammate events to you as new turns.
+3. Spawn one background teammate per ready task, passing its task_id. The
+   runtime claims the task before starting the teammate.
+4. End your turn after spawning. Do not block the Lead loop waiting for results;
+   the runtime delivers teammate events to you asynchronously as new turns.
 
 When a teammate's result arrives, continue coordinating: spawn more
 teammates for newly unblocked tasks, or shut down idle teammates with
@@ -259,7 +319,7 @@ Memory rules:
 Important rules:
 
 1. You are a subagent, not the main agent.
-2. You cannot delegate: the task tool is not available to you. The task graph above
+2. You cannot delegate: the subagent tool is not available to you. The task graph above
    is available and is a different thing.
 3. You have your own conversation context, which is separate from the parent agent's.
 4. You share the working directory, filesystem and task graph with the parent agent
