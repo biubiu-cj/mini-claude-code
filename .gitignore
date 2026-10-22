@@ -23,6 +23,12 @@ __pycache__/
 *.local.json
 *.bak
 
+# 个人笔记:只保留在本地,不公开
+.memory/
+面试讲解.md
+总结.txt
+jl.md
+
 # 编辑器
 .vscode/
 .idea/
